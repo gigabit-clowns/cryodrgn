@@ -134,6 +134,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Lazy loading if full dataset is too large to fit in memory",
     )
     group.add_argument(
+        "--scratch",
+        metavar="WHERE",
+        help="With --lazy, keep a copy of the images as they are first read and read "
+        "the later epochs from it: 'memory', or a file on fast local storage, which "
+        "later commands reading the same particles reuse",
+    )
+    group.add_argument(
         "--shuffler-size",
         type=int,
         default=0,
@@ -691,6 +698,7 @@ def main(args: argparse.Namespace) -> None:
             window_r=args.window_r,
             max_threads=args.max_threads,
             device=device,
+            scratch=args.scratch,
         )
     else:
         assert args.encode_mode == "tilt"
@@ -709,6 +717,7 @@ def main(args: argparse.Namespace) -> None:
             device=device,
             dose_per_tilt=args.dose_per_tilt,
             angle_per_tilt=args.angle_per_tilt,
+            scratch=args.scratch,
         )
     Nimg, D = data.N, data.D
 

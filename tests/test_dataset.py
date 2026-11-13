@@ -1,6 +1,7 @@
 import pytest
 import os
 import numpy as np
+import torch
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.data import DataLoader
 from cryodrgn.dataset import DataShuffler, ImageDataset, TiltSeriesData, make_dataloader
@@ -211,3 +212,18 @@ def test_data_shuffler(particles, indices, batch_size, buffer_size):
 
     # epochs should be shuffled differently
     assert any(epoch1_indices != epoch2_indices), epoch1_indices
+
+
+@pytest.mark.parametrize("particles", ["toy.star"], indirect=True)
+@pytest.mark.parametrize("where", ["memory", "file"])
+def test_batches_read_through_a_scratch_are_the_same(tmpdir, particles, where):
+    """A scratch serves the epochs after the first, and changes no batch."""
+    scratch = "memory" if where == "memory" else os.path.join(tmpdir, "particles")
+    plain = ImageDataset(mrcfile=particles.path, lazy=True)
+    held = ImageDataset(mrcfile=particles.path, lazy=True, scratch=scratch)
+    for _ in range(2):
+        expected = make_dataloader(plain, batch_size=7, shuffle=True, seed=5)
+        batches = make_dataloader(held, batch_size=7, shuffle=True, seed=5)
+        for a, b in zip(expected, batches):
+            assert torch.equal(a["y"], b["y"])
+            assert torch.equal(a["index"], b["index"])

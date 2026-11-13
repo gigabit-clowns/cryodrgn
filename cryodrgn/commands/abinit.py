@@ -115,6 +115,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         default=16,
         help="Number of threads (default: %(default)s).",
     )
+    group.add_argument(
+        "--scratch",
+        metavar="WHERE",
+        help="With --lazy, keep a copy of the images as they are first read and read "
+        "the later epochs from it: 'memory', or a file on fast local storage, which "
+        "later commands reading the same particles reuse",
+    )
 
     group = parser.add_argument_group("Logging")
     group.add_argument(
@@ -692,6 +699,7 @@ class ModelTrainer:
             max_threads=self.configs.max_threads,
             lazy=self.configs.lazy,
             datadir=self.configs.datadir,
+            scratch=self.configs.scratch,
         )
         self.n_particles_dataset = self.data.N
         self.n_tilts_dataset = self.data.N
@@ -1666,6 +1674,7 @@ def main(args: argparse.Namespace) -> None:
         load_poses=args.load_poses,
         lazy=args.lazy,
         max_threads=args.max_threads,
+        scratch=args.scratch,
         log_interval=args.log_interval,
         log_heavy_interval=args.checkpoint,
         verbose_time=args.verbose_time,

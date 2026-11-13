@@ -49,6 +49,7 @@ class ImageDataset(torch.utils.data.Dataset):
         window_r=0.85,
         max_threads=16,
         device: Union[str, torch.device] = "cpu",
+        scratch: Optional[str] = None,
     ):
         self.keepreal = keepreal
         datadir = datadir or ""
@@ -60,6 +61,11 @@ class ImageDataset(torch.utils.data.Dataset):
             indices=ind,
             max_threads=max_threads,
         )
+        if scratch is not None:
+            if lazy:
+                self.src.read_through_scratch(scratch)
+            else:
+                logger.info("A scratch serves lazy loading; the images are in memory")
         ny = self.src.D
         assert ny % 2 == 0, "Image size must be even."
         self.N = self.src.n
@@ -665,6 +671,7 @@ def make_dataloader(
     return vio.data.DataLoader(
         data.rows(),
         batch_sampler=_RowBatches(data, batches),
+        loader=data.src.loader,
         output="torch",
         pin_memory=torch.device(data.device).type == "cuda",
         transform=data.make_batch,

@@ -49,6 +49,12 @@ from cryodrgn.starfile import parse_star, Starfile
 
 logger = logging.getLogger(__name__)
 
+# How many images of a file a scratch takes in together, in one read of the file.
+SCRATCH_RUN_LENGTH = 64
+
+# How many files the loader of a scratch keeps open between reads.
+SCRATCH_OPEN_FILES = 64
+
 
 class ImageSource:
     """A class that returns the 3D image data in a .mrcs/.txt/.star file stack.
@@ -97,6 +103,9 @@ class ImageSource:
     ):
         self.orig_n = n
         self.D = D
+        # Where reads are dispatched: vitrio's loader shared by the process unless
+        # `read_through_scratch` gives this stack one of its own.
+        self.loader = None
 
         # If indices is provided, it overrides self.n (but not self.orig_n)
         self.indices = np.arange(n) if indices is None else indices
@@ -312,7 +321,23 @@ class ImageSource:
         if len(indices) == 0:
             return np.zeros((0, self.D, self.D), dtype=self.dtype)
 
-        return vio.data.Dataset({"image": self._reads}, index=None)[indices]["image"]
+        dataset = vio.data.Dataset({"image": self._reads}, index=None)
+        return dataset.read_async(indices, loader=self.loader).get()["image"]
+
+    def read_through_scratch(self, where: str = "memory") -> None:
+        """Keep a copy of the images of this stack as they are read, and read them
+        from it again: in memory, or in a file at `where` on fast local storage, which
+        outlives the program and serves the commands that read the stack after it.
+        """
+        locations = self._reads.locations[np.asarray(self.indices, dtype=np.intp)]
+        if where == "memory":
+            scratch = vio.create_host_image_scratch(locations, SCRATCH_RUN_LENGTH)
+        else:
+            scratch = vio.create_file_image_scratch(
+                locations, where, SCRATCH_RUN_LENGTH
+            )
+        self.loader = vio.loader(cache=SCRATCH_OPEN_FILES, scratch=scratch)
+        logger.info(f"Reading the images through a scratch in {where}")
 
     def _check_contiguous(self, indices: np.ndarray) -> None:
         """Refuse indices that, within any one file, are not consecutive."""
