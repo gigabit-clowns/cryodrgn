@@ -1,3 +1,12 @@
+> **A showcase of [vitrio](https://github.com/gigabit-clowns/vitrio), not a maintained fork.**
+> This is cryoDRGN 4.3.1 with its image reading moved onto vitrio, to show what vitrio
+> changes for a program people use. It follows no later upstream release and takes
+> no issues: use upstream for anything else. What changed:
+>
+> - Every particle stack (.mrcs, .star, .txt, .cs) is read through one `vitrio.data` source; the images are bit-identical to 4.3.1's.
+> - Training batches come from `vitrio.data.DataLoader`: the next batches are read on vitrio's threads into pinned memory, with no worker process, over cryoDRGN's own samplers, so a seed gives the same training.
+> - `--scratch memory|FILE` (with `--lazy`) serves the epochs after the first, and later commands, from a copy of the particles.
+
 ![pypi-downloads](https://img.shields.io/pypi/dm/cryodrgn?style=flat&label=PyPI%20Downloads&logo=pypi&logoColor=%233775A9&labelColor=%23FFF8EC)
 ![stable-release](https://img.shields.io/pypi/v/cryodrgn?style=flat&logo=pypi&logoColor=%233775A9&logoSize=auto&label=stable%20release&labelColor=%23FFF8EC)
 ![beta-release](https://img.shields.io/pypi/v/cryodrgn?pypiBaseUrl=https%3A%2F%2Ftest.pypi.org&style=flat&logo=pypi&logoColor=%233775A9&logoSize=auto&label=beta%20release&labelColor=%23FFF8EC)
