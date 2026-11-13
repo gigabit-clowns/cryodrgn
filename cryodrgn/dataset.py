@@ -11,18 +11,25 @@ then also estimates normalization parameters, a non-trivial computational step. 
 image data is retrieved during model training using __getitem__, the data is whitened
 using these parameters.
 
+Training goes through batches that `make_dataloader` makes with vitrio: the images of
+the next batches are read on vitrio's threads while the current one is processed, and
+each batch is processed on the dataset's device once it is handed out. A dataset says
+which rows of images a batch of its items needs (`batch_rows`) and what a batch is
+made of once they are read (`make_batch`).
+
 """
 import numpy as np
 from collections import Counter, OrderedDict
 
 import logging
 import torch
+import vitrio as vio
+from collections.abc import Iterable, Sequence
 from typing import Optional, Tuple, Union
 from cryodrgn import fft
 from cryodrgn.source import ImageSource, StarfileSource, parse_star
 from cryodrgn.masking import spherical_window_mask
 
-from torch.utils.data import DataLoader
 from torch.utils.data.sampler import BatchSampler, RandomSampler, SequentialSampler
 
 logger = logging.getLogger(__name__)
@@ -99,6 +106,18 @@ class ImageDataset(torch.utils.data.Dataset):
 
         return norm
 
+    def _process_batch(self, data):
+        """`_process` a batch of images, keeping the batch axis of a batch of one."""
+        r_particles, f_particles = self._process(data)
+
+        # this is why it is tricky for index to be allowed to be a list!
+        if r_particles is not None and len(r_particles.shape) == 2:
+            r_particles = r_particles[np.newaxis, ...]
+        if f_particles is not None and len(f_particles.shape) == 2:
+            f_particles = f_particles[np.newaxis, ...]
+
+        return r_particles, f_particles
+
     def _process(self, data):
         if data.ndim == 2:
             data = data[np.newaxis, ...]
@@ -125,13 +144,9 @@ class ImageDataset(torch.utils.data.Dataset):
         if isinstance(index, list):
             index = torch.Tensor(index).to(torch.long)
 
-        r_particles, f_particles = self._process(self.src.images(index).to(self.device))
-
-        # this is why it is tricky for index to be allowed to be a list!
-        if r_particles is not None and len(r_particles.shape) == 2:
-            r_particles = r_particles[np.newaxis, ...]
-        if f_particles is not None and len(f_particles.shape) == 2:
-            f_particles = f_particles[np.newaxis, ...]
+        r_particles, f_particles = self._process_batch(
+            self.src.images(index).to(self.device)
+        )
 
         if isinstance(index, (int, np.integer)):
             logger.debug(f"ImageDataset returning images at index ({index})")
@@ -147,6 +162,27 @@ class ImageDataset(torch.utils.data.Dataset):
             "r_tilt": None,
             "tilt": None,
             "index": index,
+        }
+
+    def rows(self) -> vio.data.Dataset:
+        """The images of this dataset as rows vitrio reads, their indices beside."""
+        return vio.data.Dataset({"image": self.src.as_vitrio_source()})
+
+    def batch_rows(self, items: Sequence[int]) -> np.ndarray:
+        """The rows of images a batch of items needs: an item is an image here."""
+        return np.asarray(items, dtype=np.intp)
+
+    def make_batch(self, batch: dict[str, torch.Tensor]) -> dict:
+        """A batch of items, as `__getitem__` makes it, out of the rows read for it."""
+        r_particles, f_particles = self._process_batch(
+            batch["image"].to(self.device, non_blocking=True)
+        )
+        return {
+            "y_real": r_particles,
+            "y": f_particles,
+            "r_tilt": None,
+            "tilt": None,
+            "index": batch["index"],
         }
 
     def get_slice(
@@ -234,12 +270,10 @@ class TiltSeriesData(ImageDataset):
     def __len__(self):
         return self.Np
 
-    def __getitem__(self, index) -> dict[str, torch.Tensor]:
-        if isinstance(index, list):
-            index = torch.Tensor(index).to(torch.long)
+    def batch_rows(self, items: Sequence[int]) -> np.ndarray:
+        """The tilts of a batch of particles: `ntilts` of each, one after another."""
         tilt_indices = []
-
-        for ii in index:
+        for ii in items:
             if self.random_tilts:
                 tilt_index = np.random.choice(
                     self.particles[ii], self.ntilts, replace=False
@@ -249,7 +283,35 @@ class TiltSeriesData(ImageDataset):
                 tilt_index = self.particles[ii][0 : self.ntilts]
             tilt_indices.append(tilt_index)
 
-        tilt_indices = np.concatenate(tilt_indices)
+        return np.concatenate(tilt_indices)
+
+    def rows(self) -> vio.data.Dataset:
+        """The tilts of this dataset as rows vitrio reads, each with its particle."""
+        particle_of_tilt = np.zeros(self.N, dtype=np.int64)
+        for particle, tilts in enumerate(self.particles):
+            particle_of_tilt[tilts] = particle
+
+        return vio.data.Dataset(
+            {"image": self.src.as_vitrio_source(), "particle": particle_of_tilt}
+        )
+
+    def make_batch(self, batch: dict[str, torch.Tensor]) -> dict:
+        """A batch of particles, as `__getitem__` makes it, out of their tilts."""
+        r_images, f_images = self._process(
+            batch["image"].to(self.device, non_blocking=True)
+        )
+        return {
+            "y": f_images,
+            "y_real": r_images,
+            "tilt_index": batch["index"],
+            "index": batch["particle"][:: self.ntilts],
+        }
+
+    def __getitem__(self, index) -> dict[str, torch.Tensor]:
+        if isinstance(index, list):
+            index = torch.Tensor(index).to(torch.long)
+
+        tilt_indices = self.batch_rows(index)
         r_images, f_images = self._process(
             self.src.images(tilt_indices).to(self.device)
         )
@@ -551,6 +613,25 @@ class _DataShufflerIterator:
         }
 
 
+class _RowBatches:
+    """The rows of images each batch of items drawn by a sampler needs."""
+
+    def __init__(self, data: ImageDataset, batches: Iterable[Sequence[int]]):
+        self.data = data
+        self.batches = batches
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def __iter__(self):
+        # PyTorch's DataLoader draws a seed for its workers from the global generator
+        # at the start of every pass, before its sampler draws one of its own; the
+        # same draw keeps every random number of a seeded run where it was.
+        torch.empty((), dtype=torch.int64).random_()
+        for items in self.batches:
+            yield self.data.batch_rows(items)
+
+
 def make_dataloader(
     data: ImageDataset,
     *,
@@ -560,22 +641,31 @@ def make_dataloader(
     shuffle: bool = True,
     seed: Optional[int] = None,
 ):
+    """The batches of a dataset, a pass over it for each iteration.
+
+    Items are drawn in batches as they always were, by a sampler of PyTorch, so that a
+    seed gives the order it gave. vitrio reads the images of the next batches on its
+    threads, into pinned memory when the dataset is on a GPU, and each batch is made on
+    the dataset's device once it is handed out. `num_workers` is kept for
+    compatibility: there are no worker processes to start.
+    """
     if shuffler_size > 0 and shuffle:
         assert data.lazy, "Only enable a data shuffler for lazy loading"
         return DataShuffler(data, batch_size=batch_size, buffer_size=shuffler_size)
-    else:
-        # see https://github.com/zhonge/cryodrgn/pull/221#discussion_r1120711123
-        # for discussion of why we use BatchSampler, etc.
-        if shuffle:
-            generator = None if seed is None else torch.Generator().manual_seed(seed)
-            sampler = RandomSampler(data, generator=generator)
-        else:
-            sampler = SequentialSampler(data)
 
-        return DataLoader(
-            data,
-            num_workers=num_workers,
-            sampler=BatchSampler(sampler, batch_size=batch_size, drop_last=False),
-            batch_size=None,
-            multiprocessing_context="spawn" if num_workers > 0 else None,
-        )
+    # see https://github.com/zhonge/cryodrgn/pull/221#discussion_r1120711123
+    # for discussion of why we use BatchSampler, etc.
+    if shuffle:
+        generator = None if seed is None else torch.Generator().manual_seed(seed)
+        sampler = RandomSampler(data, generator=generator)
+    else:
+        sampler = SequentialSampler(data)
+
+    batches = BatchSampler(sampler, batch_size=batch_size, drop_last=False)
+    return vio.data.DataLoader(
+        data.rows(),
+        batch_sampler=_RowBatches(data, batches),
+        output="torch",
+        pin_memory=torch.device(data.device).type == "cuda",
+        transform=data.make_batch,
+    )

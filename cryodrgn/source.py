@@ -10,6 +10,11 @@ instantiates the appropriate child class.
 An `images` method is used at runtime to retrieve 3D Tensors for image data
 at specified indices. Chunked access is possible using the `chunks()` method.
 
+Each child class only says where its images are, the file and the index in it of
+each one, through `_locate()`. The images are read through vitrio, as rows of a
+`vitrio.data.ImageSource`, on the threads of vitrio's loader, which also hands the
+rows of a source to `vitrio.data.DataLoader` through `as_vitrio_source()`.
+
 See also
 --------
 `cryodrgn.dataset.ImageDataset` — Using `ImageSource` data in torch.data workflows
@@ -30,14 +35,15 @@ Example usage
 >    assert chunk.shape == (20, 64, 64)
 
 """
+import functools
 import os.path
 from collections.abc import Iterable
-from concurrent import futures
 import numpy as np
 import pandas as pd
 from typing import List, Iterator, Optional, Union, Callable
 import logging
 import torch
+import vitrio as vio
 from cryodrgn.mrcfile import MRCHeader, write_mrc, fix_mrc_header
 from cryodrgn.starfile import parse_star, Starfile
 
@@ -146,7 +152,8 @@ class ImageSource:
         indices:    Filter the images using these indices.
         datadir:    Path prefix to particle stack files if loading relative stack
                     paths from a .star or .cs file.
-        max_threads:    Maximum number of CPU cores to use for data loading.
+        max_threads:    Kept for compatibility: the images are read on the threads
+                        of vitrio's loader.
 
         """
         ext = os.path.splitext(filepath)[-1][1:]
@@ -265,11 +272,66 @@ class ImageSource:
 
         return images
 
+    def _locate(self) -> tuple[np.ndarray, np.ndarray]:
+        """Where each of the `orig_n` images of this stack is.
+
+        Returns:
+            The file of each image, and its index in that file, counting from zero,
+            or -1 for an image that is a whole file.
+        """
+        raise NotImplementedError("Subclasses of `ImageSource` must implement this!")
+
+    @functools.cached_property
+    def _files(self) -> tuple[np.ndarray, np.ndarray]:
+        files, positions = self._locate()
+        return np.asarray(files), np.asarray(positions, dtype=np.int64)
+
+    @functools.cached_property
+    def _reads(self) -> "vio.data.ImageSource":
+        """The `orig_n` images of this stack as rows vitrio reads.
+
+        Only the first file is asked for its shape, as before, so that a source of
+        many stacks is quick to make; a file that does not hold what it is said to is
+        reported when it is read.
+        """
+        files, positions = self._files
+        locations = [
+            vio.ImageLocation(path) if position < 0 else vio.ImageLocation(path, position)
+            for path, position in zip(files.tolist(), positions.tolist())
+        ]
+        return vio.data.ImageSource(
+            locations, data_type=np.dtype(self.dtype), check=False
+        )
+
     def _images(
         self, indices: np.ndarray, require_contiguous: bool = False
     ) -> np.ndarray:
         """Retrieve images at specified indices from this stack's files."""
-        raise NotImplementedError("Subclasses of `ImageSource` must implement this!")
+        if require_contiguous:
+            self._check_contiguous(indices)
+        if len(indices) == 0:
+            return np.zeros((0, self.D, self.D), dtype=self.dtype)
+
+        return vio.data.Dataset({"image": self._reads}, index=None)[indices]["image"]
+
+    def _check_contiguous(self, indices: np.ndarray) -> None:
+        """Refuse indices that, within any one file, are not consecutive."""
+        files, positions = self._files
+        batch_files, batch_positions = files[indices], positions[indices]
+        for path in np.unique(batch_files):
+            in_file = batch_positions[batch_files == path]
+            if not np.all(in_file == in_file[0] + np.arange(len(in_file))):
+                raise ValueError("MRC indices are not contiguous!")
+
+    def as_vitrio_source(self):
+        """The `n` images of this stack, as a source of rows for `vitrio.data`.
+
+        Reads go to the files when the stack is lazy, and to the images already in
+        memory when it is not.
+        """
+        if self.lazy:
+            return self._reads.subset(np.asarray(self.indices, dtype=np.intp))
+        return vio.data.ArraySource(self.data)
 
     def chunks(
         self,
@@ -385,57 +447,12 @@ class MRCFileSource(ImageSource):
             indices=indices,
         )
 
-    def _images(
-        self,
-        indices: np.ndarray,
-        data: Optional[np.ndarray] = None,
-        tgt_indices: Optional[np.ndarray] = None,
-        require_contiguous: bool = False,
-    ) -> np.ndarray:
-        if data is None:
-            data = np.zeros((len(indices), self.D, self.D), dtype=self.dtype)
-            if tgt_indices is not None:
-                raise ValueError(
-                    "Target indices can only be specified when passing "
-                    "in a pre-allocated array using `data`!"
-                )
-            tgt_indices = np.arange(len(indices))
-        else:
-            if tgt_indices is not None:
-                if len(tgt_indices) != len(indices):
-                    raise ValueError(
-                        f"`indices` ({len(indices)}) and `tgt_indices` "
-                        f"({len(tgt_indices)}) length mismatch!"
-                    )
-            else:
-                tgt_indices = np.arange(len(indices))
-
-        assert isinstance(tgt_indices, np.ndarray)
-        is_contiguous = np.all(indices == indices[0] + np.arange(len(indices)))
-        if require_contiguous and not is_contiguous:
-            raise ValueError("MRC indices are not contiguous!")
-
-        with open(self.mrcfile_path) as f:
-            if is_contiguous:
-                f.seek(self.start)
-                offset = indices[0] * self.stride
-                # 'offset' in the call below is w.r.t the current position of f
-                _data = np.fromfile(
-                    f, dtype=self.dtype, count=self.size * len(indices), offset=offset
-                ).reshape(-1, self.ny, self.nx)
-                data[tgt_indices, ...] = _data
-
-            else:
-                for index, tgt_index in zip(indices, tgt_indices):
-                    f.seek(self.start)
-                    offset = index * self.stride
-                    # 'offset' in the call below is w.r.t the current position of f
-                    _data = np.fromfile(
-                        f, dtype=self.dtype, count=self.size, offset=offset
-                    ).reshape(self.ny, self.nx)
-                    data[tgt_index, ...] = _data
-
-        return data
+    def _locate(self) -> tuple[np.ndarray, np.ndarray]:
+        # A file of a single image is read whole; any other holds its images along
+        # its first axis, whether it states them as a stack or as one volume.
+        is_image = len(vio.query_descriptor(self.mrcfile_path).extents) == 2
+        positions = np.full(1, -1) if is_image else np.arange(self.orig_n)
+        return np.full(len(positions), self.mrcfile_path, dtype=object), positions
 
     def write(
         self,
@@ -508,38 +525,11 @@ class _MRCDataFrameSource(ImageSource):
             )
         return self._sources[filepath]
 
-    def _images(
-        self, indices: np.ndarray, require_contiguous: bool = False
-    ) -> np.ndarray:
-        def load_single_mrcs(filepath, df):
-            src = self._get_mrc_source(filepath)
-            if src is None:
-                raise ValueError(f"Missing MRC file `{filepath}`.")
-
-            # `df.index` indicates the positions where the data needs to be inserted
-            # and returned for use by caller
-            return df.index, src._images(
-                df["__mrc_index"].to_numpy(), require_contiguous=require_contiguous
-            )
-
-        data = np.zeros((len(indices), self.D, self.D), dtype=self.dtype)
-
-        # Create a DataFrame corresponding to the indices we're interested in
-        batch_df = self.df.iloc[indices].reset_index(drop=True)
-        groups = batch_df.groupby("__mrc_filepath")
-        max_threads = min(self.max_threads, len(groups))
-        with futures.ThreadPoolExecutor(max_threads) as executor:
-            to_do = []
-            for filepath, _df in groups:
-                future = executor.submit(load_single_mrcs, filepath, _df)
-                to_do.append(future)
-
-            for future in futures.as_completed(to_do):
-                data_indices, _data = future.result()
-                for idx, d in enumerate(data_indices):
-                    data[d] = _data[idx, :, :] if _data.ndim == 3 else _data
-
-        return data
+    def _locate(self) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            self.df["__mrc_filepath"].to_numpy(dtype=object),
+            self.df["__mrc_index"].to_numpy(dtype=np.int64),
+        )
 
     @property
     def sources(self) -> Iterator[tuple[str, MRCFileSource | None]]:
